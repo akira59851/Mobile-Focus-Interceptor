@@ -1,0 +1,8 @@
+{
+    "display_name": "Mobile Focus Interceptor",
+    "loading_order": 1,
+    "js": "index.js",
+    "author": "akira",
+    "version": "1.0.0",
+    "description": "拦截移动端代码自动聚焦，防止虚拟键盘频繁弹出。"
+}
