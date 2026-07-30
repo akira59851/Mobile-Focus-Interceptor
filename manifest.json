@@ -3,6 +3,6 @@
     "loading_order": 1,
     "js": "index.js",
     "author": "akira",
-    "version": "1.0.0",
-    "description": "拦截移动端代码自动聚焦，防止虚拟键盘频繁弹出。"
+    "version": "1.1.0",
+    "description": "拦截移动端自动聚焦，防止键盘在不需要时频繁弹出；优化键盘粘贴大量文本时卡顿的问题，性能对齐长按粘贴。"
 }
