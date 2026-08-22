@@ -1,8 +1,8 @@
 {
-    "display_name": "Mobile Focus Interceptor",
+    "display_name": "移动端优化小工具",
     "loading_order": 1,
     "js": "index.js",
     "author": "akira",
-    "version": "1.1.0",
-    "description": "拦截移动端自动聚焦，防止键盘在不需要时频繁弹出；优化键盘粘贴大量文本时卡顿的问题，性能对齐长按粘贴。"
+    "version": "1.2.0",
+    "description": "专治 SillyTavern 移动端的小毛病——键盘乱弹、粘贴长文本卡顿、Token Counter 分词高亮假死；双端共有的问题也会顺手一并修复。"
 }
