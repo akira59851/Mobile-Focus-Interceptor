@@ -6,7 +6,8 @@
    针对 SillyTavern 移动端痛点优化的前端插件，双端共有的问题也会顺手一并修复。
 
    模块 A：聚焦拦截（仅移动端）
-           拦截代码自动聚焦，只在用户主动点击输入框时允许聚焦弹出键盘。
+           拦截主会话输入框的代码自动聚焦，只在用户主动点击时允许弹出键盘；
+           拦截仅绑定到 #send_textarea 元素实例，不修改全局 focus 方法。
    模块 B：键盘粘贴卡顿修复（仅移动端）
            beforeinput 拦截 + visibility:hidden 抑制重绘，将分段粘贴合并为一次性渲染；
            合并窗口按文本量自适应，超大文本分段/重复粘贴不逐段整段重写。
@@ -33,52 +34,195 @@ function initMobileFocusInterceptor() {
         return;
     }
 
-    var lastTouchTime = 0;
-    var wasTouchOnInput = false;
+    var inputElements = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+    var patchedElement = null;
+    var patchedElementRecord = null;
+    var userFocusWindowMs = 1500;
+    var lastUserFocusTarget = null;
+    var lastUserFocusTime = 0;
 
-    function updateTouchTime(e) {
-        lastTouchTime = Date.now();
-        var el = e.target;
-        wasTouchOnInput = (
-            el.tagName === 'INPUT' ||
-            el.tagName === 'TEXTAREA' ||
-            el.tagName === 'SELECT' ||
+    function isEditableElement(el) {
+        return el instanceof HTMLElement && (
+            inputElements.has(el.tagName) ||
             el.isContentEditable
         );
     }
 
-    document.addEventListener('touchstart', updateTouchTime, { passive: true, capture: true });
-    document.addEventListener('pointerdown', updateTouchTime, { passive: true, capture: true });
-    document.addEventListener('mousedown', updateTouchTime, { capture: true });
-
-    var originalFocus = HTMLElement.prototype.focus;
-    var inputElements = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
-
-    HTMLElement.prototype.focus = function (options) {
-        var now = Date.now();
-        var isUserInitiated = (now - lastTouchTime) < 500 && wasTouchOnInput;
-
-        if (isUserInitiated || !inputElements.has(this.tagName)) {
-            return originalFocus.call(this, options);
+    /**
+     * Find the exact editable control activated by the user. composedPath() also
+     * handles controls inside web components; label.control covers label taps.
+     */
+    function getUserFocusTarget(e) {
+        var path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+        if (path.length === 0 && e.target) {
+            path = [e.target];
         }
 
-        if (!this.isConnected) {
-            return originalFocus.call(this, options);
-        }
-        var computedStyle = window.getComputedStyle(this);
-        if (computedStyle.display === 'none' || computedStyle.visibility === 'hidden') {
-            return originalFocus.call(this, options);
+        for (var i = 0; i < path.length; i++) {
+            var el = path[i];
+            if (!(el instanceof HTMLElement)) continue;
+            if (isEditableElement(el)) return el;
+            if (el.tagName === 'LABEL' && isEditableElement(el.control)) {
+                return el.control;
+            }
         }
 
+        return null;
+    }
+
+    function rememberUserFocusTarget(e) {
+        // Synthetic events must not grant scripts permission to bypass the guard.
+        if (e.isTrusted === false) return null;
+        lastUserFocusTarget = getUserFocusTarget(e);
+        lastUserFocusTime = lastUserFocusTarget ? Date.now() : 0;
+        return lastUserFocusTarget;
+    }
+
+    function restoreDirectUserFocus(e) {
+        var target = rememberUserFocusTarget(e);
+        if (
+            !target ||
+            !shouldBlockAutomaticFocus(target)
+        ) {
+            return;
+        }
+
+        // Run the element's original focus method while the trusted click
+        // gesture is still active. This recovers mobile taps whose browser
+        // default focus was lost.
+        callOriginalFocus(target);
+    }
+
+    document.addEventListener('touchstart', rememberUserFocusTarget, { passive: true, capture: true });
+    document.addEventListener('pointerdown', rememberUserFocusTarget, { passive: true, capture: true });
+    document.addEventListener('mousedown', rememberUserFocusTarget, { capture: true });
+    document.addEventListener('click', restoreDirectUserFocus, { capture: true });
+
+    function shouldBlockAutomaticFocus(el) {
+        return el.id === 'send_textarea';
+    }
+
+    function wasDirectlyActivatedByUser(el) {
+        return lastUserFocusTarget === el && Date.now() - lastUserFocusTime <= userFocusWindowMs;
+    }
+
+    function callOriginalFocus(el, options) {
+        var focusMethod = patchedElementRecord && el === patchedElement && el.focus === patchedElementRecord.patchedFocus
+            ? patchedElementRecord.originalFocus
+            : el.focus;
+
+        if (typeof focusMethod === 'function') {
+            return focusMethod.call(el, options);
+        }
         return undefined;
-    };
+    }
+
+    function patchElement(el) {
+        if (!(el instanceof HTMLElement) || !shouldBlockAutomaticFocus(el) || el === patchedElement) {
+            return;
+        }
+
+        var ownDescriptor = Object.getOwnPropertyDescriptor(el, 'focus');
+        var originalFocus = el.focus;
+        if (typeof originalFocus !== 'function') {
+            return;
+        }
+
+        var patchedFocus = function (options) {
+            if (
+                this !== el ||
+                !shouldBlockAutomaticFocus(el) ||
+                wasDirectlyActivatedByUser(el)
+            ) {
+                return originalFocus.call(this, options);
+            }
+
+            if (!el.isConnected) {
+                return originalFocus.call(el, options);
+            }
+            var computedStyle = window.getComputedStyle(el);
+            if (computedStyle.display === 'none' || computedStyle.visibility === 'hidden') {
+                return originalFocus.call(el, options);
+            }
+
+            return undefined;
+        };
+
+        try {
+            Object.defineProperty(el, 'focus', {
+                configurable: true,
+                enumerable: ownDescriptor ? ownDescriptor.enumerable : false,
+                writable: true,
+                value: patchedFocus,
+            });
+            patchedElement = el;
+            patchedElementRecord = {
+                patchedFocus: patchedFocus,
+                originalFocus: originalFocus,
+                ownDescriptor: ownDescriptor,
+            };
+        } catch (err) {
+            console.warn('[MobileFocus] 无法拦截目标输入框的 focus：', err);
+        }
+    }
+
+    function restorePatchedElement() {
+        if (!patchedElement || !patchedElementRecord) {
+            return;
+        }
+
+        var el = patchedElement;
+        var record = patchedElementRecord;
+        try {
+            // Do not overwrite a focus method installed later by another plugin.
+            if (el.focus === record.patchedFocus) {
+                if (record.ownDescriptor) {
+                    Object.defineProperty(el, 'focus', record.ownDescriptor);
+                } else {
+                    delete el.focus;
+                }
+            }
+        } catch (err) {
+            console.warn('[MobileFocus] 无法恢复目标输入框的 focus：', err);
+        }
+
+        patchedElement = null;
+        patchedElementRecord = null;
+    }
+
+    function syncTargetElement() {
+        var currentTarget = document.getElementById('send_textarea');
+        if (patchedElement && patchedElement !== currentTarget) {
+            restorePatchedElement();
+        }
+        if (currentTarget && currentTarget !== patchedElement) {
+            patchElement(currentTarget);
+        }
+    }
+
+    syncTargetElement();
+
+    var observer = new MutationObserver(syncTargetElement);
+
+    observer.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['id'],
+        childList: true,
+        subtree: true,
+    });
 
     function destroy() {
-        HTMLElement.prototype.focus = originalFocus;
-        document.removeEventListener('touchstart', updateTouchTime, { capture: true });
-        document.removeEventListener('pointerdown', updateTouchTime, { capture: true });
-        document.removeEventListener('mousedown', updateTouchTime, { capture: true });
+        observer.disconnect();
+        restorePatchedElement();
+        document.removeEventListener('touchstart', rememberUserFocusTarget, { capture: true });
+        document.removeEventListener('pointerdown', rememberUserFocusTarget, { capture: true });
+        document.removeEventListener('mousedown', rememberUserFocusTarget, { capture: true });
+        document.removeEventListener('click', restoreDirectUserFocus, { capture: true });
+        window.removeEventListener('beforeunload', destroy);
         window.__mobileFocusInterceptorInstalled__ = false;
+        if (window.__mobileFocusInterceptorDestroy__ === destroy) {
+            delete window.__mobileFocusInterceptorDestroy__;
+        }
     }
 
     window.addEventListener('beforeunload', destroy);
