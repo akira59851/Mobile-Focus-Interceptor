@@ -13,7 +13,51 @@
    模块 C：Token Counter 分词高亮渲染优化（桌面/移动通用）
            透明拦截 appendChild/insertBefore + content-visibility 分组，
            解决大文本分词高亮渲染导致的页面假死；首屏上限 + 「继续加载」逐帧渐进渲染。
+   模块 D：ST 原生 :has() 样式失效修复（桌面/移动通用）
+           删除 ST 主样式表中触发整页样式失效的 z-index 规则，
+           用内联 z-index 复刻其行为，修复抽屉/弹窗后键盘开合持续卡顿。
+   模块 E：外部小窗键盘布局冻结（仅移动端）
+           Android 外部小窗应用呼出键盘时也会缩小 ST 的布局视口；
+           检测到 ST 输入框未聚焦，或刚切出 ST 后输入框仍保留焦点时的
+           视口骤减后，用像素高度冻结主布局，避免 ST 跟随外部键盘缩放，
+           同时保留 ST 自身键盘的原生行为。
+
+   控制台输出：默认只打印 1 条整体加载成功提示，以及真正出现问题时的 warn / error；
+           把下方 MFI_DEBUG 改为 true，可额外看到分模块就绪信息与详细调试日志。
    ============================================================ */
+
+// ============================================================
+// 调试输出
+// ============================================================
+// MFI_DEBUG：控制台输出开关，默认 false（减少控制台噪音，避免刷屏）
+//   false —— 只有「插件整体加载成功」1 条提示 + 真正出现问题时的 warn / error
+//   true  —— 额外打印各模块就绪信息（按模块分别打印）与运行期详细调试日志
+// 排查问题时改为 true 再刷新 ST 即可；warn / error 不受此开关影响，始终打印。
+var MFI_DEBUG = false;
+
+/** 分模块的详细日志：仅 MFI_DEBUG=true 时输出 */
+function mfiLog() {
+    if (MFI_DEBUG) {
+        console.log.apply(console, arguments);
+    }
+}
+
+/** 运行期详细日志（键盘布局冻结/恢复等过程性事件）：仅 MFI_DEBUG=true 时输出 */
+function mfiDebug() {
+    if (MFI_DEBUG) {
+        console.debug.apply(console, arguments);
+    }
+}
+
+/** 整体加载成功提示：不受 MFI_DEBUG 影响，每次加载只打印一条 */
+var mfiLoadedLogged = false;
+function mfiLogLoaded() {
+    if (mfiLoadedLogged) {
+        return;
+    }
+    mfiLoadedLogged = true;
+    console.log('[MobileFocus] 移动端优化小工具已加载');
+}
 
 function isMobile() {
     return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth <= 768;
@@ -30,6 +74,7 @@ function initMobileFocusInterceptor() {
     window.__mobileFocusInterceptorInstalled__ = true;
 
     if (!isMobile()) {
+        mfiLog('[MobileFocus] 模块 A 跳过：仅移动端启用');
         return;
     }
 
@@ -84,7 +129,7 @@ function initMobileFocusInterceptor() {
     window.addEventListener('beforeunload', destroy);
     window.__mobileFocusInterceptorDestroy__ = destroy;
 
-    console.log('[MobileFocus] 聚焦拦截器就绪');
+    mfiLog('[MobileFocus] 模块 A 聚焦拦截器就绪');
 }
 
 // ============================================================
@@ -108,6 +153,7 @@ function initPastePerformanceFix() {
     // 仅移动端生效（2026-08-22 回归）：桌面端粘贴大文本无此卡顿，避免拦截误伤；
     // 模块 A 聚焦拦截同样仅移动端，与此保持一致
     if (!isMobile()) {
+        mfiLog('[MobileFocus] 模块 B 跳过：仅移动端启用（桌面端粘贴大文本无此卡顿）');
         return;
     }
 
@@ -349,7 +395,7 @@ function initPastePerformanceFix() {
     window.addEventListener('beforeunload', destroy);
     window.__pastePerformanceFixDestroy__ = destroy;
 
-    console.log('[MobileFocus] 粘贴性能优化就绪');
+    mfiLog('[MobileFocus] 模块 B 粘贴性能优化就绪');
 }
 
 // ============================================================
@@ -545,7 +591,7 @@ function initTokenCounterRenderFix() {
                     try {
                         updateLoadMoreButton(disp);
                     } catch (e) { /* 忽略 */ }
-                    console.warn('[MobileFocus] 继续加载异常：', err);
+                    console.warn('[MobileFocus] 模块 C 继续加载异常：', err);
                 }
             }
 
@@ -723,42 +769,881 @@ function initTokenCounterRenderFix() {
         window.addEventListener('beforeunload', destroy);
         window.__tokenCounterRenderFixDestroy__ = destroy;
 
-        console.log('[MobileFocus] Token Counter 渲染优化就绪');
+        mfiLog('[MobileFocus] 模块 C Token Counter 渲染优化就绪');
     } catch (err) {
         // fail-open：任何异常都不影响插件其它模块与 ST 本身
-        console.warn('[MobileFocus] Token Counter 渲染优化初始化失败：', err);
+        console.warn('[MobileFocus] 模块 C Token Counter 渲染优化初始化失败：', err);
         window.__tokenCounterRenderFixInstalled__ = false;
     }
+}
+
+// ============================================================
+// 模块 D: ST 原生 :has() 样式失效修复（桌面/移动通用）
+// ============================================================
+// ST 主样式表中的这条规则会在抽屉/弹窗交互后被浏览器反复用于整页
+// 样式失效判断；即使规则当前没有命中，也会让 class 变化触发大范围
+// UpdateLayoutTree，表现为打开世界书/扩展管理后键盘收起越来越卡。
+//
+// 方案：只从主 style.css 的 CSSOM 中删除这一条精确规则，并用 JS 内联
+//       z-index 复刻它原本的视觉行为。匹配不到、样式表被替换或 CSSOM
+//       不可访问时 fail-open；样式表替换后由 head 观察器重新扫描。
+
+function initNativeHasInvalidationFix() {
+    if (window.__nativeHasInvalidationFixInstalled__) {
+        return;
+    }
+    window.__nativeHasInvalidationFixInstalled__ = true;
+
+    var TARGET_SELECTOR = [
+        'body:has(.drawer-content.maximized) #top-settings-holder:has(.drawer-content.openDrawer:not(.fillLeft):not(.fillRight))',
+        'body:has(.drawer-content.open) #top-settings-holder:has(.drawer-content.openDrawer:not(.fillLeft):not(.fillRight))',
+        'body:has(#character_popup.open) #top-settings-holder:has(.drawer-content.openDrawer:not(.fillLeft):not(.fillRight))',
+    ].join(', ');
+    var TARGET_Z_INDEX = '4005';
+
+    var patchedRules = [];
+    var patchedRuleKeys = new WeakMap();
+    var headObserver = null;
+    var stateObserver = null;
+    var observedStateTargets = new WeakSet();
+    var scanTimer = null;
+    var scanRetryTimer = null;
+    var scanRetries = 0;
+    var destroyed = false;
+    var managedHolder = null;
+    var originalInlineZIndex = null;
+    var inlineManaged = false;
+    var patchActive = false;
+
+    var mainStyleUrl = null;
+    try {
+        mainStyleUrl = new URL('style.css', document.baseURI);
+    } catch (err) {
+        // URL 解析失败时保持 fail-open
+        window.__nativeHasInvalidationFixInstalled__ = false;
+        return;
+    }
+
+    function normalizeSelectorText(value) {
+        return String(value || '')
+            .replace(/\s+/g, ' ')
+            .replace(/\s*,\s*/g, ', ')
+            .trim();
+    }
+
+    var normalizedTargetSelector = normalizeSelectorText(TARGET_SELECTOR);
+
+    function isMainStyleSheet(sheet) {
+        var owner = sheet && sheet.ownerNode;
+        if (!owner || owner.nodeType !== 1 || owner.tagName !== 'LINK') {
+            return false;
+        }
+
+        var isStylesheet = owner.relList && typeof owner.relList.contains === 'function'
+            ? owner.relList.contains('stylesheet')
+            : owner.rel === 'stylesheet';
+        if (!isStylesheet) {
+            return false;
+        }
+
+        try {
+            var resolved = new URL(owner.href || owner.getAttribute('href') || '', document.baseURI);
+            return resolved.origin === mainStyleUrl.origin && resolved.pathname === mainStyleUrl.pathname;
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function isTargetRule(rule) {
+        if (!rule || rule.type !== 1 || typeof rule.selectorText !== 'string' || !rule.style) {
+            return false;
+        }
+
+        return normalizeSelectorText(rule.selectorText) === normalizedTargetSelector &&
+            rule.style.length === 1 &&
+            rule.style.getPropertyValue('z-index') === TARGET_Z_INDEX &&
+            rule.style.getPropertyPriority('z-index') === '';
+    }
+
+    function collectTargetRules(ruleList, owner, found) {
+        for (var i = 0; i < ruleList.length; i++) {
+            var rule = ruleList[i];
+            if (isTargetRule(rule)) {
+                found.push({
+                    owner: owner,
+                    index: i,
+                    cssText: rule.cssText,
+                });
+                continue;
+            }
+
+            // 兼容未来 ST 把规则包进 @media/@supports/@container 的情况。
+            if (rule && rule.cssRules && rule.cssRules.length) {
+                collectTargetRules(rule.cssRules, rule, found);
+            }
+        }
+    }
+
+    function getPatchedRuleKeys(sheet) {
+        var keys = patchedRuleKeys.get(sheet);
+        if (!keys) {
+            keys = new Set();
+            patchedRuleKeys.set(sheet, keys);
+        }
+        return keys;
+    }
+
+    function ruleKey(item) {
+        return item.index + '|' + item.cssText;
+    }
+
+    function patchFoundRules(sheet, found) {
+        var byOwner = [];
+        var ownerMap = new Map();
+        var patchedKeys = getPatchedRuleKeys(sheet);
+
+        found.forEach(function (item) {
+            var key = ruleKey(item);
+            if (patchedKeys.has(key)) {
+                return;
+            }
+            var bucket = ownerMap.get(item.owner);
+            if (!bucket) {
+                bucket = [];
+                ownerMap.set(item.owner, bucket);
+                byOwner.push(bucket);
+            }
+            bucket.push(item);
+        });
+
+        byOwner.forEach(function (items) {
+            // 先删后面的规则，避免删除导致前面的索引移位。
+            items.slice().sort(function (a, b) {
+                return b.index - a.index;
+            }).forEach(function (item) {
+                try {
+                    item.owner.deleteRule(item.index);
+                    patchedKeys.add(ruleKey(item));
+                    patchedRules.push({
+                        sheet: sheet,
+                        owner: item.owner,
+                        index: item.index,
+                        cssText: item.cssText,
+                    });
+                } catch (err) {
+                    // 单条删除失败不影响其它规则，保持 fail-open。
+                }
+            });
+        });
+    }
+
+    function restorePatchedRules() {
+        var rules = patchedRules.slice().sort(function (a, b) {
+            return a.index - b.index;
+        });
+        patchedRules = [];
+        patchedRuleKeys = new WeakMap();
+        patchActive = false;
+
+        rules.forEach(function (item) {
+            if (!item.sheet || !item.sheet.ownerNode || !item.sheet.ownerNode.isConnected) {
+                return;
+            }
+            try {
+                var ownerRules = item.owner.cssRules;
+                var index = Math.min(item.index, ownerRules.length);
+                item.owner.insertRule(item.cssText, index);
+            } catch (err) {
+                // 页面已离开或样式表已重建时无需强行恢复。
+            }
+        });
+    }
+
+    function isStateElement(element) {
+        return !!(element && element.nodeType === 1 &&
+            element.matches &&
+            element.matches('.drawer-content, #character_popup'));
+    }
+
+    function containsStateElement(node) {
+        if (!node || node.nodeType !== 1) {
+            return false;
+        }
+        if (node.matches && node.matches('.drawer-content, #character_popup, #top-settings-holder, #movingDivs')) {
+            return true;
+        }
+        return !!(node.querySelector && node.querySelector('.drawer-content, #character_popup, #top-settings-holder, #movingDivs'));
+    }
+
+    function restoreManagedInline() {
+        if (!managedHolder || !inlineManaged) {
+            return;
+        }
+
+        if (originalInlineZIndex && originalInlineZIndex.value) {
+            managedHolder.style.setProperty('z-index', originalInlineZIndex.value, originalInlineZIndex.priority);
+        } else {
+            managedHolder.style.removeProperty('z-index');
+        }
+        inlineManaged = false;
+    }
+
+    function updateTopSettingsZIndex() {
+        if (!patchActive) {
+            restoreManagedInline();
+            return;
+        }
+
+        var holder = document.getElementById('top-settings-holder');
+        if (!holder) {
+            restoreManagedInline();
+            managedHolder = null;
+            originalInlineZIndex = null;
+            return;
+        }
+
+        if (holder !== managedHolder) {
+            restoreManagedInline();
+            managedHolder = holder;
+            originalInlineZIndex = {
+                value: holder.style.getPropertyValue('z-index'),
+                priority: holder.style.getPropertyPriority('z-index'),
+            };
+            inlineManaged = false;
+        }
+
+        var hasOpenDrawer = holder.querySelector('.drawer-content.openDrawer:not(.fillLeft):not(.fillRight)');
+        var body = document.body;
+        var shouldRaise = !!(hasOpenDrawer && body &&
+            body.querySelector('.drawer-content.maximized, .drawer-content.open, #character_popup.open'));
+
+        if (shouldRaise) {
+            var currentValue = holder.style.getPropertyValue('z-index');
+            // 若页面本来就有外部内联 z-index，原 CSS 规则同样无法覆盖它，
+            // 这里也不应擅自改写。
+            if (!inlineManaged && currentValue !== '' && currentValue !== TARGET_Z_INDEX) {
+                return;
+            }
+            inlineManaged = true;
+            holder.style.setProperty('z-index', TARGET_Z_INDEX);
+        } else {
+            restoreManagedInline();
+        }
+    }
+
+    function observeStateTarget(element, options) {
+        if (!element || observedStateTargets.has(element)) {
+            return;
+        }
+        observedStateTargets.add(element);
+        try {
+            stateObserver.observe(element, options);
+        } catch (err) {
+            // 忽略不可观察的节点。
+        }
+    }
+
+    function bindStateObservers() {
+        if (destroyed || !stateObserver) {
+            return;
+        }
+
+        var holder = document.getElementById('top-settings-holder');
+        var movingDivs = document.getElementById('movingDivs');
+
+        observeStateTarget(holder, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+        observeStateTarget(movingDivs, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ['class'],
+        });
+        observeStateTarget(document.body, { childList: true });
+
+        Array.prototype.forEach.call(document.querySelectorAll('.drawer-content, #character_popup'), function (element) {
+            if ((holder && holder.contains(element)) || (movingDivs && movingDivs.contains(element))) {
+                return;
+            }
+            observeStateTarget(element, {
+                attributes: true,
+                attributeFilter: ['class'],
+            });
+        });
+    }
+
+    function onStateMutations(mutations) {
+        var relevant = false;
+        for (var i = 0; i < mutations.length; i++) {
+            var mutation = mutations[i];
+            if (mutation.type === 'attributes') {
+                if (isStateElement(mutation.target)) {
+                    relevant = true;
+                    break;
+                }
+                continue;
+            }
+
+            if (mutation.type === 'childList') {
+                var j;
+                for (j = 0; j < mutation.addedNodes.length; j++) {
+                    if (containsStateElement(mutation.addedNodes[j])) {
+                        relevant = true;
+                        break;
+                    }
+                }
+                if (relevant) {
+                    break;
+                }
+                for (j = 0; j < mutation.removedNodes.length; j++) {
+                    if (containsStateElement(mutation.removedNodes[j])) {
+                        relevant = true;
+                        break;
+                    }
+                }
+                if (relevant) {
+                    break;
+                }
+            }
+        }
+
+        if (relevant) {
+            bindStateObservers();
+            updateTopSettingsZIndex();
+        }
+    }
+
+    function scanAndPatch() {
+        if (destroyed) {
+            return;
+        }
+
+        var sheets = Array.prototype.slice.call(document.styleSheets || []);
+        var mainSheetReady = false;
+        var targetHandled = false;
+
+        sheets.forEach(function (sheet) {
+            if (!isMainStyleSheet(sheet)) {
+                return;
+            }
+            var rules;
+            try {
+                rules = sheet.cssRules;
+            } catch (err) {
+                return;
+            }
+
+            if (!rules || rules.length === 0) {
+                if (sheet.ownerNode && sheet.ownerNode.addEventListener) {
+                    sheet.ownerNode.addEventListener('load', scheduleScan, { once: true });
+                }
+                return;
+            }
+            mainSheetReady = true;
+
+            var found = [];
+            collectTargetRules(rules, sheet, found);
+            if (found.length > 0) {
+                patchFoundRules(sheet, found);
+                targetHandled = true;
+                return;
+            }
+
+            // 已经打过补丁的 sheet 再次扫描时目标本来就不存在。
+            if (patchedRules.some(function (item) {
+                return item.sheet === sheet;
+            })) {
+                targetHandled = true;
+                return;
+            }
+        });
+
+        if (mainSheetReady) {
+            scanRetries = 0;
+        } else {
+            // link 已插入 DOM 但尚未登记进 document.styleSheets 时，
+            // 用有界重试兜底；load 事件仍会正常触发下一次扫描。
+            patchActive = false;
+            restoreManagedInline();
+            scheduleScanRetry();
+            return;
+        }
+
+        if (!targetHandled) {
+            patchActive = false;
+            restoreManagedInline();
+            return;
+        }
+
+        patchActive = true;
+        bindStateObservers();
+        updateTopSettingsZIndex();
+    }
+
+    function scheduleScan() {
+        if (destroyed || scanTimer !== null) {
+            return;
+        }
+        scanTimer = setTimeout(function () {
+            scanTimer = null;
+            scanAndPatch();
+        }, 0);
+    }
+
+    function scheduleScanRetry() {
+        if (destroyed || scanRetryTimer !== null || scanRetries >= 12) {
+            return;
+        }
+        scanRetries++;
+        scanRetryTimer = setTimeout(function () {
+            scanRetryTimer = null;
+            scheduleScan();
+        }, 50);
+    }
+
+    function isStylesheetLink(node) {
+        if (!node || node.nodeType !== 1 || node.tagName !== 'LINK') {
+            return false;
+        }
+        var isStylesheet = node.relList && typeof node.relList.contains === 'function'
+            ? node.relList.contains('stylesheet')
+            : node.rel === 'stylesheet';
+        return isStylesheet;
+    }
+
+    function onHeadMutations(mutations) {
+        var relevant = false;
+        for (var i = 0; i < mutations.length; i++) {
+            var mutation = mutations[i];
+            if (mutation.type === 'attributes') {
+                if (isStylesheetLink(mutation.target)) {
+                    relevant = true;
+                    break;
+                }
+                continue;
+            }
+
+            if (mutation.type === 'childList') {
+                var j;
+                for (j = 0; j < mutation.addedNodes.length; j++) {
+                    var added = mutation.addedNodes[j];
+                    if (isStylesheetLink(added) && added.addEventListener) {
+                        added.addEventListener('load', scheduleScan, { once: true });
+                    }
+                    if (isStylesheetLink(added) || (added.querySelector && added.querySelector('link[rel~="stylesheet"]'))) {
+                        relevant = true;
+                        break;
+                    }
+                }
+                if (relevant) {
+                    break;
+                }
+                for (j = 0; j < mutation.removedNodes.length; j++) {
+                    var removed = mutation.removedNodes[j];
+                    if (isStylesheetLink(removed) || (removed.querySelector && removed.querySelector('link[rel~="stylesheet"]'))) {
+                        relevant = true;
+                        break;
+                    }
+                }
+                if (relevant) {
+                    break;
+                }
+            }
+        }
+
+        if (relevant) {
+            scheduleScan();
+        }
+    }
+
+    stateObserver = new MutationObserver(onStateMutations);
+    bindStateObservers();
+    scanAndPatch();
+
+    headObserver = new MutationObserver(onHeadMutations);
+    headObserver.observe(document.head || document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['href', 'rel'],
+    });
+
+    function destroy() {
+        if (destroyed) {
+            return;
+        }
+        destroyed = true;
+
+        if (scanTimer !== null) {
+            clearTimeout(scanTimer);
+            scanTimer = null;
+        }
+        if (scanRetryTimer !== null) {
+            clearTimeout(scanRetryTimer);
+            scanRetryTimer = null;
+        }
+        if (headObserver) {
+            headObserver.disconnect();
+            headObserver = null;
+        }
+        if (stateObserver) {
+            stateObserver.disconnect();
+            stateObserver = null;
+        }
+
+        restorePatchedRules();
+        restoreManagedInline();
+        patchActive = false;
+        managedHolder = null;
+        originalInlineZIndex = null;
+        window.__nativeHasInvalidationFixInstalled__ = false;
+    }
+
+    window.addEventListener('beforeunload', destroy);
+    window.__nativeHasInvalidationFixDestroy__ = destroy;
+    mfiLog('[MobileFocus] 模块 D ST 原生 :has 样式失效修复就绪');
+}
+
+// ============================================================
+// 模块 E: 外部小窗键盘布局冻结（仅移动端）
+// ============================================================
+// 真机数据（Android Chrome 152）：
+//   正常：innerHeight=695，100dvh=695.71，100lvh=751.71
+//   外部小窗键盘弹出：innerHeight=361，100dvh=361.71，100lvh=417.71
+//
+// 连 lvh 都一起缩小，说明 Android 确实缩小了布局视口，而不是只改 dvh。
+// ST 的 viewport meta 使用 interactive-widget=resizes-content，因此
+// body/#sheld/#chat 会跟着键盘开合变化。不能直接改 meta，否则 ST 自己
+// 的输入框也会被键盘遮住。
+//
+// 方案：检测「ST 输入框未聚焦，或刚切出 ST 后输入框仍保留 DOM 焦点时，
+//       布局视口骤减」后，用像素高度临时冻结 body/#sheld/#chat；回到 ST
+//       点击输入框前解除，保留 ST 自身键盘的原生 resizes-content 行为。
+//       样式表、事件和状态都只在本模块内管理，异常时 fail-open。
+
+function initExternalKeyboardViewportFix() {
+    if (window.__externalKeyboardViewportFixInstalled__) {
+        return;
+    }
+
+    if (!isMobile()) {
+        mfiLog('[MobileFocus] 模块 E 跳过：仅移动端启用');
+        return;
+    }
+
+    var MIN_KEYBOARD_SHRINK = 120;
+    var RESTORE_TOLERANCE = 12;
+    var BASELINE_RETRY_MS = 600;
+    var EXTERNAL_CONTEXT_MS = 15000;
+
+    var baseline = null;
+    var frozen = false;
+    var styleEl = null;
+    var resetTimer = null;
+    var initialBaselineTimer = null;
+    var lastBlurAt = 0;
+    var destroyed = false;
+
+    function isEditable(element) {
+        return !!(
+            element && (
+                element.tagName === 'INPUT' ||
+                element.tagName === 'TEXTAREA' ||
+                element.tagName === 'SELECT' ||
+                element.isContentEditable
+            )
+        );
+    }
+
+    function measureLayout() {
+        var body = document.body;
+        var sheld = document.getElementById('sheld');
+        var chat = document.getElementById('chat');
+
+        if (!body || !sheld || !chat) {
+            return null;
+        }
+
+        return {
+            viewportW: window.innerWidth,
+            viewportH: window.innerHeight,
+            bodyH: body.getBoundingClientRect().height,
+            sheldH: sheld.getBoundingClientRect().height,
+            chatH: chat.getBoundingClientRect().height,
+            orientation: screen.orientation ? screen.orientation.type : '',
+            screenW: screen.width,
+            screenH: screen.height,
+        };
+    }
+
+    function ensureStyle() {
+        if (styleEl) {
+            return;
+        }
+
+        styleEl = document.createElement('style');
+        styleEl.id = 'mfi-external-kb-freeze-style';
+        styleEl.textContent = [
+            'html.mfi-external-kb-freeze body {',
+            '    height: var(--mfi-external-kb-body-h) !important;',
+            '}',
+            'html.mfi-external-kb-freeze #sheld {',
+            '    height: var(--mfi-external-kb-sheld-h) !important;',
+            '    max-height: var(--mfi-external-kb-sheld-h) !important;',
+            '}',
+            'html.mfi-external-kb-freeze #chat {',
+            '    height: var(--mfi-external-kb-chat-h) !important;',
+            '    max-height: var(--mfi-external-kb-chat-h) !important;',
+            '}',
+        ].join('\n');
+        (document.head || document.documentElement).appendChild(styleEl);
+    }
+
+    function setBaseline() {
+        var measured = measureLayout();
+        if (!measured || measured.bodyH <= 0 || measured.sheldH <= 0 || measured.chatH <= 0) {
+            return false;
+        }
+
+        baseline = measured;
+        return true;
+    }
+
+    function applyFreeze(reason) {
+        if (destroyed || frozen) {
+            return;
+        }
+        if (!baseline && !setBaseline()) {
+            return;
+        }
+
+        ensureStyle();
+        var root = document.documentElement;
+        root.style.setProperty('--mfi-external-kb-body-h', baseline.bodyH + 'px');
+        root.style.setProperty('--mfi-external-kb-sheld-h', baseline.sheldH + 'px');
+        root.style.setProperty('--mfi-external-kb-chat-h', baseline.chatH + 'px');
+        root.classList.add('mfi-external-kb-freeze');
+        frozen = true;
+
+        mfiDebug('[MobileFocus] 模块 E 外部小窗键盘布局冻结：', reason);
+    }
+
+    function releaseFreeze(reason) {
+        if (!frozen) {
+            return;
+        }
+
+        document.documentElement.classList.remove('mfi-external-kb-freeze');
+        frozen = false;
+
+        mfiDebug('[MobileFocus] 模块 E 外部小窗键盘布局恢复：', reason);
+    }
+
+    function scheduleBaselineReset(reason) {
+        clearTimeout(resetTimer);
+        releaseFreeze(reason);
+        baseline = null;
+        resetTimer = setTimeout(function () {
+            resetTimer = null;
+            if (destroyed) {
+                return;
+            }
+            setBaseline();
+            evaluateViewport('baseline-reset');
+        }, BASELINE_RETRY_MS);
+    }
+
+    function evaluateViewport(reason) {
+        if (destroyed) {
+            return;
+        }
+
+        var measured = measureLayout();
+        if (!measured) {
+            return;
+        }
+
+        var screenChanged = baseline && (
+            Math.abs(measured.screenW - baseline.screenW) > 50 ||
+            Math.abs(measured.screenH - baseline.screenH) > 50
+        );
+        var widthChanged = baseline &&
+            Math.abs(measured.viewportW - baseline.viewportW) > 50;
+        var orientationChanged = baseline && measured.orientation &&
+            baseline.orientation &&
+            measured.orientation !== baseline.orientation;
+
+        // 真正旋转屏幕时宽高会一起变化；外部键盘只会改变高度，不能把
+        // 高度骤减误判成旋转。
+        if (screenChanged && widthChanged && orientationChanged) {
+            scheduleBaselineReset(reason + ':orientation');
+            return;
+        }
+
+        if (!baseline) {
+            setBaseline();
+            return;
+        }
+
+        var shrink = baseline.viewportH - measured.viewportH;
+        var editableActive = isEditable(document.activeElement);
+        var externalContext = lastBlurAt > 0 && (Date.now() - lastBlurAt < EXTERNAL_CONTEXT_MS);
+        var stInputFocused = editableActive && document.hasFocus() && !externalContext;
+
+        // ST 自己的输入框聚焦且页面仍在 ST 前台时保持原生行为；
+        // 若刚切出过 ST，则即使输入框仍是 DOM 焦点也按外部键盘处理。
+        if (stInputFocused) {
+            releaseFreeze(reason + ':st-input');
+            return;
+        }
+
+        if (!frozen) {
+            if (shrink >= MIN_KEYBOARD_SHRINK && (!editableActive || externalContext)) {
+                applyFreeze(reason + ':shrink=' + Math.round(shrink));
+            } else if (Math.abs(shrink) < RESTORE_TOLERANCE) {
+                // 浏览器地址栏收展等小幅变化时更新基线，避免误判。
+                setBaseline();
+            }
+            return;
+        }
+
+        if (measured.viewportH >= baseline.viewportH - RESTORE_TOLERANCE) {
+            releaseFreeze(reason + ':restored');
+        }
+    }
+
+    function onResize() {
+        evaluateViewport('resize');
+    }
+
+    function onOrientationChange() {
+        var measured = measureLayout();
+        var screenChanged = !baseline || !measured || (
+            Math.abs(measured.screenW - baseline.screenW) > 50 ||
+            Math.abs(measured.screenH - baseline.screenH) > 50
+        );
+        var widthChanged = !baseline || !measured ||
+            Math.abs(measured.viewportW - baseline.viewportW) > 50;
+
+        if (screenChanged && widthChanged) {
+            scheduleBaselineReset('orientationchange');
+        }
+    }
+
+    function onWindowBlur() {
+        lastBlurAt = Date.now();
+        evaluateViewport('window-blur');
+    }
+
+    function onUserInteraction() {
+        lastBlurAt = 0;
+        evaluateViewport('user-interaction');
+    }
+
+    function onEditableInteraction() {
+        releaseFreeze('editable-interaction');
+    }
+
+    function destroy() {
+        if (destroyed) {
+            return;
+        }
+        destroyed = true;
+
+        clearTimeout(resetTimer);
+        clearTimeout(initialBaselineTimer);
+        releaseFreeze('destroy');
+
+        window.removeEventListener('resize', onResize);
+        window.removeEventListener('orientationchange', onOrientationChange);
+        window.removeEventListener('blur', onWindowBlur);
+        document.removeEventListener('pointerdown', onUserInteraction, true);
+        document.removeEventListener('touchstart', onUserInteraction, true);
+        document.removeEventListener('focusin', onUserInteraction, true);
+        document.removeEventListener('pointerdown', onEditableEvent, true);
+        document.removeEventListener('touchstart', onEditableEvent, true);
+        document.removeEventListener('focusin', onEditableEvent, true);
+
+        if (window.visualViewport) {
+            window.visualViewport.removeEventListener('resize', onResize);
+        }
+
+        if (styleEl && styleEl.parentNode) {
+            styleEl.parentNode.removeChild(styleEl);
+        }
+        styleEl = null;
+
+        var root = document.documentElement;
+        root.classList.remove('mfi-external-kb-freeze');
+        root.style.removeProperty('--mfi-external-kb-body-h');
+        root.style.removeProperty('--mfi-external-kb-sheld-h');
+        root.style.removeProperty('--mfi-external-kb-chat-h');
+
+        baseline = null;
+        window.__externalKeyboardViewportFixInstalled__ = false;
+    }
+
+    function onEditableEvent(event) {
+        if (isEditable(event.target)) {
+            onEditableInteraction();
+        }
+    }
+
+    window.addEventListener('resize', onResize, { passive: true });
+    window.addEventListener('orientationchange', onOrientationChange, { passive: true });
+    window.addEventListener('blur', onWindowBlur, { passive: true });
+    document.addEventListener('pointerdown', onUserInteraction, { passive: true, capture: true });
+    document.addEventListener('touchstart', onUserInteraction, { passive: true, capture: true });
+    document.addEventListener('focusin', onUserInteraction, { passive: true, capture: true });
+    document.addEventListener('pointerdown', onEditableEvent, { passive: true, capture: true });
+    document.addEventListener('touchstart', onEditableEvent, { passive: true, capture: true });
+    document.addEventListener('focusin', onEditableEvent, { passive: true, capture: true });
+
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', onResize, { passive: true });
+    }
+
+    initialBaselineTimer = setTimeout(function () {
+        initialBaselineTimer = null;
+        if (destroyed) {
+            return;
+        }
+        setBaseline();
+        evaluateViewport('initial');
+    }, 300);
+
+    window.addEventListener('beforeunload', destroy);
+    window.__externalKeyboardViewportFixDestroy__ = destroy;
+    window.__externalKeyboardViewportFixInstalled__ = true;
+    mfiLog('[MobileFocus] 模块 E 外部小窗键盘布局冻结就绪');
 }
 
 // ============================================================
 // 扩展入口
 // ============================================================
 
+/** 启动全部模块，最后打印整体加载提示（关闭调试时控制台只有这一条） */
+function startAllModules() {
+    initMobileFocusInterceptor();
+    initPastePerformanceFix();
+    initTokenCounterRenderFix();
+    initNativeHasInvalidationFix();
+    initExternalKeyboardViewportFix();
+    mfiLogLoaded();
+}
+
 function init() {
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function () {
-            initMobileFocusInterceptor();
-            initPastePerformanceFix();
-            initTokenCounterRenderFix();
-        });
+        document.addEventListener('DOMContentLoaded', startAllModules);
     } else {
-        initMobileFocusInterceptor();
-        initPastePerformanceFix();
-        initTokenCounterRenderFix();
+        startAllModules();
     }
 }
 
 if (typeof window !== 'undefined' && !window.ST_EXTENSION) {
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', function () {
-            initMobileFocusInterceptor();
-            initPastePerformanceFix();
-            initTokenCounterRenderFix();
-        });
-    } else {
-        initMobileFocusInterceptor();
-        initPastePerformanceFix();
-        initTokenCounterRenderFix();
-    }
+    init();
 }
