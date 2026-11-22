@@ -2,8 +2,11 @@
     "display_name": "移动端优化小工具",
     "loading_order": 1,
     "js": "index.js",
+    "hooks": {
+        "clean": "cleanExtensionData"
+    },
     "author": "akira",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "debug_info": "在 index.js 顶部将 MFI_DEBUG 改为 true 开启调试日志。",
     "repository": "https://github.com/akira59851/Mobile-Focus-Interceptor",
     "description": "主要优化 SillyTavern 移动端的界面与输入体验，部分优化同时适用于桌面端。"
